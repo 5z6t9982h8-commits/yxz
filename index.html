@@ -131,6 +131,8 @@ textarea{resize:vertical;min-height:2.8em}
 .ccard .crow:last-child{margin-bottom:0}
 .ccard .ck{flex-shrink:0;width:3.2em;color:#7fa8cc;letter-spacing:.5em;text-indent:.1em;font-size:.8rem;padding-top:.1em}
 .ccard .cv{color:#d5e1ee;min-width:0}
+.ccard .pic.genning{opacity:.45;animation:genPulse 1.2s ease-in-out infinite}
+@keyframes genPulse{50%{opacity:.85}}
 /* 小說式敘事段 */
 .novel{position:relative;padding:.15rem .1rem 1.4rem;font-size:.95rem;line-height:2;color:#d7e2ee;white-space:pre-wrap;word-break:break-word}
 /* 案件視窗分組與類型鍵 */
@@ -637,6 +639,40 @@ function updateHUD(flashKeys){
   $("leaveCaseBtn").classList.toggle("hidden", s.status==="日常");
 }
 
+/* ---------- 背景執行輔助 ---------- */
+function fx(url,opt){ // 請求可在頁面退到背景時繼續（小於 60KB 的請求）
+  try{ if(opt&&opt.body&&opt.body.length<60000) opt.keepalive=true; }catch(e){}
+  return fetch(url,opt);
+}
+function waitVisible(){
+  return new Promise(r=>{
+    if(!document.hidden) return r();
+    const h=()=>{ if(!document.hidden){ document.removeEventListener("visibilitychange",h); r(); } };
+    document.addEventListener("visibilitychange",h);
+  });
+}
+async function callWithRetry(messages){
+  let lastErr;
+  for(let i=0;i<3;i++){
+    try{ return await callLLM(messages); }
+    catch(e){
+      lastErr=e;
+      const net=(e instanceof TypeError)||/network|load failed|failed to fetch|cancel/i.test(e.message||"");
+      if(i<2&&net){ await waitVisible(); await new Promise(r=>setTimeout(r,700)); continue; }
+      throw e;
+    }
+  }
+  throw lastErr;
+}
+let _wake=null;
+async function keepAwake(on){
+  try{
+    if(on){ if(!_wake&&navigator.wakeLock) _wake=await navigator.wakeLock.request("screen"); }
+    else if(_wake){ await _wake.release(); _wake=null; }
+  }catch(e){}
+}
+document.addEventListener("visibilitychange",()=>{ if(!document.hidden&&state.busy) keepAwake(true); });
+
 /* ---------- API 呼叫 ---------- */
 async function callLLM(messages){
   const sys=systemPrompt(), key=state.apiKey, model=state.model, P=state.provider;
@@ -645,7 +681,7 @@ async function callLLM(messages){
     url="https://api.anthropic.com/v1/messages";
     opt={method:"POST",headers:{"Content-Type":"application/json","x-api-key":key,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
       body:JSON.stringify({model, max_tokens:3000, system:sys, messages})};
-    const r=await fetch(url,opt); const d=await r.json();
+    const r=await fx(url,opt); const d=await r.json();
     if(!r.ok) throw new Error(d.error?.message||("HTTP "+r.status));
     return (d.content||[]).map(b=>b.text||"").join("");
   }
@@ -655,7 +691,7 @@ async function callLLM(messages){
       body:JSON.stringify({system_instruction:{parts:[{text:sys}]},
         contents:messages.map(m=>({role:m.role==="assistant"?"model":"user",parts:[{text:m.content}]})),
         generationConfig:{maxOutputTokens:3000}})};
-    const r=await fetch(url,opt); const d=await r.json();
+    const r=await fx(url,opt); const d=await r.json();
     if(!r.ok) throw new Error(d.error?.message||("HTTP "+r.status));
     return d.candidates?.[0]?.content?.parts?.map(p=>p.text||"").join("")||"";
   }
@@ -663,7 +699,7 @@ async function callLLM(messages){
   url = P==="grok" ? "https://api.x.ai/v1/chat/completions" : "https://api.openai.com/v1/chat/completions";
   opt={method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+key},
     body:JSON.stringify({model, max_tokens:3000, messages:[{role:"system",content:sys},...messages]})};
-  const r=await fetch(url,opt); const d=await r.json();
+  const r=await fx(url,opt); const d=await r.json();
   if(!r.ok) throw new Error(d.error?.message||("HTTP "+r.status));
   return d.choices?.[0]?.message?.content||"";
 }
@@ -680,7 +716,7 @@ function parseReply(raw){
 
 /* ---------- 回合流程 ---------- */
 async function runTurn(userText, {replaceLast=false, silentUser=false, hideUser=false}={}){
-  if(state.busy) return; state.busy=true; document.body.classList.add("busy");
+  if(state.busy) return; state.busy=true; document.body.classList.add("busy"); keepAwake(true);
   try{
     if(replaceLast){
       // 移除最後一組 user+assistant
@@ -697,7 +733,7 @@ async function runTurn(userText, {replaceLast=false, silentUser=false, hideUser=
 
     const thinking=document.createElement("div"); thinking.className="sys"; thinking.textContent="燕行舟正在思考⋯⋯"; log().appendChild(thinking); scrollBottom();
     let raw;
-    try{ raw=await callLLM(state.history); }
+    try{ raw=await callWithRetry(state.history); }
     finally{ thinking.remove(); }
 
     const j=parseReply(raw);
@@ -721,9 +757,9 @@ async function runTurn(userText, {replaceLast=false, silentUser=false, hideUser=
     await typewriter(bubble, j.story);
     autosave();
   }catch(err){
-    sysLine("⚠ 生成失敗："+err.message+"（可按「重新生成」再試）", true);
+    sysLine("⚠ 生成中斷："+err.message+"。妳的指令已保留，按「↻ 重新生成」即可續跑（切出畫面前建議等回覆打完）。", true);
   }finally{
-    state.busy=false; document.body.classList.remove("busy");
+    state.busy=false; document.body.classList.remove("busy"); keepAwake(false);
     state.editIndex=-1; $("editHint").classList.add("hidden");
   }
 }
@@ -913,12 +949,7 @@ $("startBtn").onclick=()=>{
   state.stats={time:"—",location:"事務所",status:"日常",mood:"慵懶",affection:10,money:800};
   enterGame(); log().innerHTML="";
   sysRecord("── 台北・某條老街的二樓，燕行舟偵探事務所 ──");
-  const yanCard={name:"燕行舟",age:"27",identity:"私家偵探・事務所所長",
-    appearance:"黑色狼尾亂髮，金屬框墨鏡下一雙總含著笑的眼，右耳三枚耳骨釘，身形高瘦挺拔",
-    traits:"毒舌狡黠、外熱內冷，破案時眼裡才有真正的光",
-    notes:"戒菸中（成效存疑），由助理全程監督",img:"__cover__"};
-  const meCard={name:state.persona.name,age:state.persona.age,identity:"偵探助理",
-    appearance:state.persona.look||"", traits:state.persona.personality||"", notes:state.persona.other||""};
+  const [yanCard,meCard]=makeLeadCards();
   [yanCard,meCard].forEach(c=>{ state.characters[c.name]=c;
     state.transcript.push({type:"card",card:c}); addCharCard(c); });
   requestPortrait(meCard);
@@ -931,6 +962,12 @@ $("resumeBtn").onclick=()=>{
   state.provider=$("provider").value; state.model=$("modelName").value.trim()||s.model;
   state.persona=s.persona||state.persona; state.stats=s.stats; state.history=s.history||[];
   state.transcript=s.transcript||[]; state.characters=s.characters||{}; state.lastUserHidden=!!s.lastUserHidden;
+  if(!state.characters["燕行舟"]){
+    const [yanCard,meCard]=makeLeadCards();
+    state.characters[yanCard.name]=yanCard; state.characters[meCard.name]=meCard;
+    state.transcript.unshift({type:"card",card:meCard});
+    state.transcript.unshift({type:"card",card:yanCard});
+  }
   enterGame(); rebuildFromTranscript(); updateHUD(false);
   toast("已載入存檔，接續進度");
 };
@@ -968,6 +1005,15 @@ $("iconBtn").onclick=()=>{
 
 /* ---------- 初始化 ---------- */
 function coverSrc(){ return $("coverArt").src; }
+function makeLeadCards(){
+  const yan={name:"燕行舟",age:"27",gender:"男",identity:"私家偵探・事務所所長",
+    appearance:"黑色狼尾亂髮，金屬框墨鏡下一雙總含著笑的眼，右耳三枚耳骨釘，身形高瘦挺拔",
+    traits:"毒舌狡黠、外熱內冷，破案時眼裡才有真正的光",
+    notes:"戒菸中（成效存疑），由助理全程監督",img:"__cover__"};
+  const me={name:state.persona.name,age:state.persona.age,gender:"女",identity:"偵探助理",
+    appearance:state.persona.look||"", traits:state.persona.personality||"", notes:state.persona.other||""};
+  return [yan,me];
+}
 
 /* ===== 角色插畫生成（使用玩家自己的圖片 API） ===== */
 function shrinkToJpeg(src,size,q){
@@ -983,7 +1029,7 @@ function shrinkToJpeg(src,size,q){
 async function genPortrait(card){
   const prov=state.imgProvider, key=state.imgKey||state.apiKey;
   if(!prov||prov==="off"||!key) return null;
-  const prompt=`精緻唯美的動漫插畫人物半身肖像，畫風參考現代日系厚塗，柔和筆觸與電影感光影，偵探懸疑故事氛圍，藍灰色調背景。單人構圖、無文字。人物：${card.age?card.age+"歲":"成年"}${card.identity?("的"+card.identity):""}，外貌：${card.appearance||"氣質沉穩"}。${card.traits?("氣質性格："+card.traits+"。"):""}成年人。`;
+  const prompt=`精緻唯美的動漫插畫人物半身肖像，畫風參考現代日系厚塗，柔和筆觸與電影感光影，偵探懸疑故事氛圍，藍灰色調背景。單人構圖、無文字。人物：${card.age?card.age+"歲":"成年"}${card.gender==="女"?"女性":card.gender==="男"?"男性":""}${card.identity?("，"+card.identity):""}，外貌：${card.appearance||"氣質沉穩"}。${card.traits?("氣質性格："+card.traits+"。"):""}成年人。`;
   let b64=null;
   if(prov==="gpt"){
     const r=await fetch("https://api.openai.com/v1/images/generations",{method:"POST",
@@ -1009,6 +1055,12 @@ async function genPortrait(card){
 }
 async function requestPortrait(c){
   if(!c || c.img) return;
+  const _prov=state.imgProvider, _key=state.imgKey||state.apiKey;
+  if(!_prov||_prov==="off"||!_key){
+    if(!state._imgHint){ state._imgHint=true;
+      sysLine("（提示：到設定頁開啟「角色圖片生成」並填入金鑰，角色卡會自動生成插畫肖像；之後也可以點卡片上的肖像手動生成）"); }
+    return;
+  }
   try{
     const uri=await genPortrait(c);
     if(uri){
